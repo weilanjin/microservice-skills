@@ -9,13 +9,8 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
-var db *sql.DB
-
-func GetDB() *sql.DB {
-	return db
-}
-
-func InitDB(conf *Config) error {
+// 初始化数据库连接池
+func InitDB(conf *Config) (*sql.DB, error) {
 	if conf.Timeout <= 0 {
 		conf.Timeout = 5 * time.Second
 	}
@@ -23,10 +18,9 @@ func InitDB(conf *Config) error {
 	ctx, cancel := context.WithTimeout(context.Background(), conf.Timeout)
 	defer cancel()
 
-	var err error
-	db, err = sql.Open("mysql", conf.DSN)
+	db, err := sql.Open("mysql", conf.DSN)
 	if err != nil {
-		return fmt.Errorf("failed to open database: %w", err)
+		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 	// 影响最大并发数。
 	// 过大可能导致数据库负载过高，过小会限制并发性能。
@@ -43,5 +37,5 @@ func InitDB(conf *Config) error {
 	// 典型值 10min，根据业务需求调整。
 	db.SetConnMaxIdleTime(conf.MaxIdleTime) // 空闲连接的最大生存时间
 
-	return db.PingContext(ctx)
+	return db, db.PingContext(ctx)
 }
