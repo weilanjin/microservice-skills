@@ -78,7 +78,7 @@ func TestDelete(t *testing.T) {
 }
 
 func TestQueryRow(t *testing.T) {
-	query := Query[*User]{
+	query := FindReq[*User]{
 		NewRow: func() *User {
 			return &User{} // 替换为你的结构体类型
 		},

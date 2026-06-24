@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -155,9 +156,8 @@ func (db *DB) execContext(ctx context.Context, query string, args ...any) (sql.R
 	return res, err
 }
 
-// queryContext wraps QueryContext with debug logging and slow SQL detection
 // 封装 QueryContext，支持调试日志和慢 SQL 检测
-func (db *DB) queryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	if isPrintCtx(ctx) {
 		log.Printf("[SQL] query: %s args: %v", query, args)
 	}
@@ -179,10 +179,6 @@ func (db *DB) QueryRowContext(ctx context.Context, query string, args ...any) *s
 		log.Printf("[SlowSQL] %dms query row: %s args: %v", elapsed.Milliseconds(), query, args)
 	}
 	return row
-}
-
-func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-	return db.queryContext(ctx, query, args...)
 }
 
 func (db *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
@@ -302,7 +298,7 @@ func (db *DB) Update(ctx context.Context, table string, where Wheres, update map
 	return rowsAffected, nil
 }
 
-type Query[T Row] struct {
+type FindReq[T Row] struct {
 	NewRow  func() T // 如何创建对象
 	Where   Wheres   // 过滤条件
 	OrderBy string   // 排序条件，例如 "created_at DESC"
@@ -310,7 +306,7 @@ type Query[T Row] struct {
 	Offset  int      // 分页偏移量，0表示不偏移
 }
 
-func FindOne[T Row](ctx context.Context, db *DB, table string, query Query[T]) (T, error) {
+func FindOne[T Row](ctx context.Context, db *DB, table string, query FindReq[T]) (T, error) {
 	query.Limit = 1
 
 	rows, err := Find(ctx, db, table, query)
@@ -327,7 +323,7 @@ func FindOne[T Row](ctx context.Context, db *DB, table string, query Query[T]) (
 
 // Find queries rows with support for filtering, sorting, and pagination
 // 支持过滤、排序和分页的查询方法
-func Find[T Row](ctx context.Context, db *DB, table string, query Query[T]) ([]T, error) {
+func Find[T Row](ctx context.Context, db *DB, table string, query FindReq[T]) ([]T, error) {
 	if query.NewRow == nil {
 		return nil, fmt.Errorf("NewRow function is required")
 	}
@@ -361,7 +357,7 @@ func Find[T Row](ctx context.Context, db *DB, table string, query Query[T]) ([]T
 		}
 	}
 
-	rows, err := db.queryContext(ctx, sqlText, args...)
+	rows, err := db.QueryContext(ctx, sqlText, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -387,4 +383,88 @@ func Find[T Row](ctx context.Context, db *DB, table string, query Query[T]) ([]T
 		return nil, err
 	}
 	return results, nil
+}
+
+// QueryRow queries a single row and scans it into the provided type T
+func QueryRow[T any](ctx context.Context, db *DB, querySQL string) (T, error) {
+	var data T
+
+	row := db.QueryRowContext(ctx, querySQL)
+	if err := row.Err(); err != nil {
+		return data, fmt.Errorf("query latest bot status error: %w", err)
+	}
+
+	v := reflect.ValueOf(&data).Elem()
+
+	// 场景 A：如果 T 是结构体，我们需要利用反射将所有字段铺开
+	// 注意：这里简单以 Kind() == reflect.Struct 判断，实际生产中可能需要排除 time.Time 或 sql.Nullxxx 等特殊结构体
+	if v.Kind() == reflect.Struct {
+		numCols := v.NumField()
+		columns := make([]interface{}, numCols)
+
+		// 提取结构体内部所有字段的内存地址
+		for i := 0; i < numCols; i++ {
+			columns[i] = v.Field(i).Addr().Interface()
+		}
+
+		// 将查询结果 Scan 进提取出的字段地址中
+		err := row.Scan(columns...)
+		return data, err
+	}
+
+	// 场景 B：如果 T 是基本类型 (如 int, string) 或者官方自带的值类型 (如 sql.NullString)
+	// 完全不需要反射字段，直接取 data 的地址进行 Scan
+	err := row.Scan(&data)
+	return data, err
+}
+
+// https://go.dev/wiki/SQLInterface#getting-a-table
+func Query[T any](ctx context.Context, db *DB, querySQL string) (out []T, err error) {
+	rows, err := db.QueryContext(ctx, querySQL)
+	if err != nil {
+		return nil, fmt.Errorf("query latest bot status error: %w", err)
+	}
+	defer rows.Close()
+
+	var table []T
+	var data T // 声明承接容器
+
+	v := reflect.ValueOf(&data).Elem()
+
+	// ==========================================
+	// 场景 A：如果 T 是结构体类型
+	// ==========================================
+	if v.Kind() == reflect.Struct {
+		numCols := v.NumField()
+		columns := make([]any, numCols)
+
+		// 循环外：提前获取结构体各字段的内存地址
+		for i := 0; i < numCols; i++ {
+			columns[i] = v.Field(i).Addr().Interface()
+		}
+
+		// 循环内：复用地址，零反射
+		for rows.Next() {
+			if err := rows.Scan(columns...); err != nil {
+				fmt.Println("Case Read Error ", err)
+				continue
+			}
+			table = append(table, data)
+		}
+		return table, nil
+	}
+
+	// ==========================================
+	// 场景 B：如果 T 是基础类型 (如 int, string, sql.NullString)
+	// ==========================================
+	for rows.Next() {
+		// 基础类型直接取 data 的地址进行 Scan，完全不需要反射
+		if err := rows.Scan(&data); err != nil {
+			fmt.Println("Case Read Error ", err)
+			continue
+		}
+		table = append(table, data)
+	}
+
+	return table, nil
 }
