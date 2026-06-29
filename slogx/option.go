@@ -1,30 +1,18 @@
 package slogx
 
-import (
-	"io"
-	"log/slog"
-)
+import "log/slog"
 
-// Option customizes logger Config.
+// Option 用于自定义日志初始化配置。
 type Option func(*Config)
 
-// WithLevel sets the log level.
+// WithLevel 设置最低输出日志级别。
 func WithLevel(level slog.Leveler) Option {
 	return func(c *Config) {
 		c.Level = level
 	}
 }
 
-// WithWriter sets the output writer.
-func WithWriter(w io.Writer) Option {
-	return func(c *Config) {
-		if w != nil {
-			c.Writer = w
-		}
-	}
-}
-
-// WithFormat sets output format (text/json).
+// WithFormat 设置日志输出格式，支持 text/json。
 func WithFormat(format Format) Option {
 	return func(c *Config) {
 		if format != "" {
@@ -33,16 +21,19 @@ func WithFormat(format Format) Option {
 	}
 }
 
-// WithColor explicitly enables or disables colorized output.
-func WithColor() Option {
-	return func(c *Config) {
-		c.Color = true
-	}
-}
-
-// WithSource controls whether to emit source location.
+// WithSource 开启源码位置输出。
 func WithSource() Option {
 	return func(c *Config) {
 		c.AddSource = true
+	}
+}
+
+// WithOutput 添加一个日志输出端。 可以指定多个
+func WithOutput(output Output) Option {
+	return func(c *Config) {
+		if output.Writer == nil {
+			return
+		}
+		c.Outputs = append(c.Outputs, output)
 	}
 }

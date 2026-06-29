@@ -9,21 +9,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
 const timeFormat = "2006-01-02 15:04:05.000"
 
-// LevelFatal defines a custom fatal level above error.
-// slog 标准库没有 Fatal 级别，这里扩展一个更高的级别用于致命错误。
-const LevelFatal = slog.Level(12)
-
-// Fatal 以致命级别输出日志后直接退出进程（exit code 1）。
-func Fatal(ctx context.Context, msg string, args ...any) {
-	logWithSource(ctx, LevelFatal, msg, args, 1)
-}
-
-// Format indicates output format.
+// Format 表示日志输出格式。
 type Format string
 
 const (
@@ -31,22 +23,28 @@ const (
 	FormatJSON Format = "json"
 )
 
-// Config holds logger setup options.
+// Output 表示一个日志输出端。
+type Output struct {
+	Writer io.Writer
+	Format Format
+	Level  slog.Leveler // 最低输出级别
+}
+
+// Config 保存日志初始化配置。
 type Config struct {
 	Level      slog.Leveler // slog.LevelDebug < slog.LevelInfo < slog.LevelWarn < slog.LevelError < LevelFatal
-	Writer     io.Writer
+	Outputs    []Output
 	AddSource  bool
 	Color      bool
 	Format     Format
 	SourceRoot string
 }
 
-// Init builds a slog Logger with colorized console output and source location,
-// sets it as the default logger, and returns it.
+// Init 初始化 slog.Logger，设置为默认 logger 并返回。
 func Init(opts ...Option) *slog.Logger {
 	cfg := &Config{
 		Level:      slog.LevelInfo,
-		Writer:     os.Stdout,
+		Outputs:    []Output{{Writer: os.Stdout}},
 		AddSource:  true,
 		Color:      true,
 		Format:     FormatText,
@@ -54,10 +52,6 @@ func Init(opts ...Option) *slog.Logger {
 	}
 	for _, opt := range opts {
 		opt(cfg)
-	}
-
-	if cfg.Color { // 如果启用了颜色输出, 检查是否可以使用颜色
-		cfg.Color = shouldUseColor(cfg.Writer)
 	}
 
 	baseHandler := newBaseHandler(cfg)
@@ -69,28 +63,72 @@ func Init(opts ...Option) *slog.Logger {
 }
 
 func newBaseHandler(cfg *Config) slog.Handler {
+	outputs := normalizeOutputs(cfg)
+	handlers := make([]slog.Handler, 0, len(outputs))
+	for _, output := range outputs {
+		handlers = append(handlers, newOutputHandler(cfg, output))
+	}
+	if len(handlers) == 1 {
+		return handlers[0]
+	}
+	return slog.NewMultiHandler(handlers...)
+}
+
+func newOutputHandler(cfg *Config, output Output) slog.Handler {
+	level := output.Level
+	if level == nil {
+		level = cfg.Level
+	}
+	format := output.Format
+	if format == "" {
+		format = cfg.Format
+	}
+
+	color := cfg.Color
+	if format == FormatJSON {
+		color = false
+	} else if color { // 如果启用了颜色输出, 检查当前输出端是否可以使用颜色
+		color = shouldUseColor(output.Writer)
+	}
+
 	options := &slog.HandlerOptions{
-		Level:     cfg.Level,
+		Level:     level,
 		AddSource: cfg.AddSource,
 		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-			return replaceAttr(cfg.Color, cfg.SourceRoot, a)
+			return replaceAttr(color, cfg.SourceRoot, a)
 		},
 	}
 
-	if cfg.Format == FormatJSON {
-		cfg.Color = false
-		return slog.NewJSONHandler(cfg.Writer, options) // json 格式输出
+	var handler slog.Handler
+	if format == FormatJSON {
+		handler = slog.NewJSONHandler(output.Writer, options) // json 格式输出
+	} else {
+		// text 格式输出
+		handler = &consoleHandler{
+			w:           output.Writer,
+			mu:          new(sync.Mutex),
+			level:       level,
+			addSource:   cfg.AddSource,
+			replaceAttr: options.ReplaceAttr,
+			color:       color,
+			sourceRoot:  cfg.SourceRoot,
+		}
 	}
+	return handler
+}
 
-	// text 格式输出
-	return &consoleHandler{
-		w:           cfg.Writer,
-		level:       cfg.Level,
-		addSource:   cfg.AddSource,
-		replaceAttr: options.ReplaceAttr,
-		color:       cfg.Color,
-		sourceRoot:  cfg.SourceRoot,
+func normalizeOutputs(cfg *Config) []Output {
+	outputs := make([]Output, 0, len(cfg.Outputs))
+	for _, output := range cfg.Outputs {
+		if output.Writer == nil {
+			continue
+		}
+		outputs = append(outputs, output)
 	}
+	if len(outputs) == 0 {
+		return []Output{{Writer: os.Stdout}}
+	}
+	return outputs
 }
 
 func replaceAttr(enableColor bool, sourceRoot string, a slog.Attr) slog.Attr {
@@ -182,8 +220,6 @@ const (
 // slog.Level 颜色
 func colorize(level slog.Level, text string) string {
 	switch {
-	case level >= LevelFatal:
-		return colorMagenta + text + colorReset
 	case level >= slog.LevelError:
 		return colorRed + text + colorReset
 	case level >= slog.LevelWarn:
@@ -195,16 +231,13 @@ func colorize(level slog.Level, text string) string {
 	}
 }
 
-// levelText normalizes level to display text, ensuring fatal renders as FATAL instead of ERROR+N.
+// levelText 格式化日志级别，确保 fatal 输出为 FATAL 而不是 ERROR+N。
 func levelText(level slog.Level) string {
-	if level >= LevelFatal {
-		return "FATAL"
-	}
 	return strings.ToUpper(level.String())
 }
 
-// logWithSource builds a record with caller PC to retain correct source location when called via wrappers.
-// callerSkip is the additional stack frames to skip above this helper (e.g., wrapper functions).
+// logWithSource 构造带调用方源码位置的日志记录。
+// callerSkip 表示需要额外跳过的调用栈层数。
 func logWithSource(ctx context.Context, level slog.Level, msg string, args []any, callerSkip int) {
 	h := slog.Default().Handler()
 
@@ -247,8 +280,6 @@ func parseLevel(v string) (slog.Level, bool) {
 		return slog.LevelWarn, true
 	case "error":
 		return slog.LevelError, true
-	case "fatal":
-		return LevelFatal, true
 	default:
 		return slog.LevelInfo, false
 	}

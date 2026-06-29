@@ -9,11 +9,13 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 type consoleHandler struct {
 	w           io.Writer
+	mu          *sync.Mutex
 	level       slog.Leveler
 	addSource   bool
 	replaceAttr func([]string, slog.Attr) slog.Attr
@@ -103,6 +105,8 @@ func (h *consoleHandler) Handle(ctx context.Context, r slog.Record) error {
 	}
 
 	buf.WriteByte('\n')
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	_, err := h.w.Write(buf.Bytes())
 	return err
 }
@@ -113,6 +117,7 @@ func (h *consoleHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	merged = append(merged, attrs...)
 	return &consoleHandler{
 		w:           h.w,
+		mu:          h.mu,
 		level:       h.level,
 		addSource:   h.addSource,
 		replaceAttr: h.replaceAttr,
@@ -131,6 +136,7 @@ func (h *consoleHandler) WithGroup(name string) slog.Handler {
 	groups = append(groups, name)
 	return &consoleHandler{
 		w:           h.w,
+		mu:          h.mu,
 		level:       h.level,
 		addSource:   h.addSource,
 		replaceAttr: h.replaceAttr,
